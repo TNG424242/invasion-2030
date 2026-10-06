@@ -7,6 +7,9 @@
 #include <Arduino.h>
 #include <LovyanGFX.hpp>
 #include <cstdarg>
+#include <SPI.h>
+#include <SD.h>
+#include <Update.h>
 
 // Manual CYD 2432S028 config (from LovyanGFX Sunton preset).
 // LCD: MOSI 13, MISO 12, SCLK 14, DC 2, CS 15, RST -1, BL 21 (HSPI)
@@ -381,33 +384,112 @@ static bool msArmorHit(int bx, int by) {
   return true;
 }
 
+// ---------- Exit to SD launcher ----------
+// HOLD top-left corner 3s -> "EXIT TO LAUNCHER? TAP=YES" overlay.
+// Any tap confirms (mounts SD, OTA-flashes /launcher.bin, reboots);
+// 6s timeout cancels. Corner presses never fire game actions.
+static SPIClass exitSpi(VSPI);
+static bool exitCorner = false;
+static bool exitConfirm = false;
+static uint32_t exitConfirmT0 = 0;
+
+static void exitMsg(const char* l1, const char* l2) {
+  lcd.fillRect(40, 80, 240, 80, TFT_BLACK);
+  lcd.drawRect(40, 80, 240, 80, TFT_WHITE);
+  lcd.setTextSize(1);
+  lcd.setTextColor(TFT_YELLOW, TFT_BLACK);
+  lcd.setCursor(58, 96); lcd.print(l1);
+  lcd.setTextColor(TFT_WHITE, TFT_BLACK);
+  lcd.setCursor(58, 116); lcd.print(l2);
+}
+
+static void exitDoFlash() {
+  Serial.println("EXIT: flashing /launcher.bin from SD...");
+  exitMsg("EXITING...", "flashing launcher");
+  exitSpi.begin(18, 19, 23, 5);  // SCK, MISO, MOSI, CS
+  if (!SD.begin(5, exitSpi, 10000000)) { exitMsg("NO SD CARD", "resuming..."); delay(2000); return; }
+  File f = SD.open("/launcher.bin");
+  if (!f) { exitMsg("NO LAUNCHER.BIN", "resuming..."); delay(2000); return; }
+  size_t sz = f.size();
+  Serial.printf("EXIT: launcher.bin %u bytes\n", (unsigned)sz);
+  if (sz < 100000 || sz > 2000000 || !Update.begin(sz)) {
+    f.close(); exitMsg("UPDATE FAILED", "resuming..."); delay(2000); return;
+  }
+  uint8_t buf[1024];
+  size_t done = 0;
+  while (done < sz) {
+    size_t r = f.read(buf, sizeof(buf));
+    if (r == 0) break;
+    if (Update.write(buf, r) != r) break;
+    done += r;
+  }
+  f.close();
+  if (done == sz && Update.end()) {
+    Serial.println("EXIT: rebooting to launcher");
+    delay(400); ESP.restart();
+  }
+  exitMsg("FLASH FAILED", "resuming..."); delay(2000);
+}
+
+static void drawExitOverlay() {
+  uint32_t left = 0, now = millis();
+  if (exitConfirmT0 + 6000 > now) left = (exitConfirmT0 + 6000 - now) / 1000;
+  exitMsg("EXIT TO LAUNCHER?", "TAP=YES, wait=NO");
+  lcd.setTextColor(TFT_WHITE, TFT_BLACK);
+  lcd.setCursor(58, 136); lcd.printf("%us left", left);
+}
+
 static void updateTouch() {
   int16_t tx, ty;
   touching = lcd.getTouch(&tx, &ty);
   uint32_t now = millis();
 
+  // exit-to-launcher confirm state: any fresh tap = YES, 6s timeout = cancel
+  if (exitConfirm) {
+    if (touching && !wasTouching) {
+      exitConfirm = false; exitCorner = false;
+      wasTouching = true;
+      exitDoFlash();  // returns only on failure; success reboots
+      return;
+    }
+    if (!touching) wasTouching = false;
+    return;
+  }
+
   if (touching && !wasTouching) {
     touchStartMs = now;
     touchStartX = tx; touchStartY = ty;
-    targetX = tx;
-    if (state == TITLE || state == GAME_OVER || state == LEVEL_CLEAR) {
-      // tap to advance handled on release
+    exitCorner = (tx < 64 && ty < 64);
+    if (!exitCorner) {
+      targetX = tx;
+      if (state == TITLE || state == GAME_OVER || state == LEVEL_CLEAR) {
+        // tap to advance handled on release
+      }
     }
   } else if (touching) {
-    // drag to move
-    if (abs(tx - targetX) > 2) targetX = tx;
-    // hold to autofire
-    if (state == PLAYING && now - touchStartMs > 450 && now - lastAutoFire > 320) {
-      firePlayer();
-      lastAutoFire = now;
+    if (exitCorner) {
+      if (tx > 96 || ty > 96) exitCorner = false;  // slid out: cancel hold
+      else if (now - touchStartMs > 3000) {
+        exitConfirm = true; exitConfirmT0 = now;
+        Serial.println("EXIT: confirm? TAP=YES, wait=NO");
+      }
+    } else {
+      // drag to move
+      if (abs(tx - targetX) > 2) targetX = tx;
+      // hold to autofire
+      if (state == PLAYING && now - touchStartMs > 450 && now - lastAutoFire > 320) {
+        firePlayer();
+        lastAutoFire = now;
+      }
     }
   }
 
   if (!touching && wasTouching) {
     uint32_t dur = now - touchStartMs;
     int move = abs(touchStartX - targetX);
-    // tap = quick release with little movement -> fire / advance screens
-    if (dur < 300 && move < 14) {
+    if (exitCorner) {
+      exitCorner = false;  // corner taps/holds never fire game actions
+    } else if (dur < 300 && move < 14) {
       if (state == PLAYING) firePlayer();
       else if (state == TITLE) { score = 0; lives = 3; level = 1; startLevel(); }
       else if (state == GAME_OVER) { score = 0; lives = 3; level = 1; startLevel(); }
@@ -1033,6 +1115,9 @@ static void draw() {
     GFX->setTextColor(TFT_YELLOW, TFT_BLACK);
     GFX->setCursor(W / 2 - 60, 190);
     GFX->print("TAP TO START");
+    GFX->setTextColor(TFT_DARKGREY, TFT_BLACK);
+    GFX->setCursor(W / 2 - 100, 204);
+    GFX->print("HOLD top-left 3s = exit");
     if (useSprite) fb.pushSprite(0, 0); else lcd.endWrite();
     return;
   }
@@ -1189,8 +1274,26 @@ void setup() {
 }
 
 void loop() {
+  // serial helper (also used for testing): type "exit" + Enter to flash back to launcher
+  static String sbuf = "";
+  while (Serial.available()) {
+    char c = (char)Serial.read();
+    if (c == '\n' || c == '\r') {
+      sbuf.trim();
+      if (sbuf == "exit") exitDoFlash();
+      sbuf = "";
+    } else if (sbuf.length() < 32) sbuf += c;
+  }
   updateTouch();
-  updateGame();
+  uint32_t now0 = millis();
+  if (exitConfirm) {
+    if (now0 - exitConfirmT0 > 6000) {
+      exitConfirm = false; exitCorner = false;
+      Serial.println("EXIT: cancelled (timeout)");
+    }
+  } else {
+    updateGame();
+  }
   static State prevState = TITLE;
   if (state != prevState) {
     logEv("S%d>L%d st%d", prevState, level, state);
@@ -1200,6 +1303,7 @@ void loop() {
   if (now - lastFrame >= 33) { // ~30fps
     lastFrame = now;
     draw();
+    if (exitConfirm) drawExitOverlay();  // on top, after push/endWrite
   }
   delay(1);
 }
