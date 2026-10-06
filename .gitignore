@@ -1,0 +1,6 @@
+.pio/
+.pioenvs/
+.vscode/
+__pycache__/
+# Frank Tunnel Run lives in its own repo (frank-tunnel-run)
+FRANK-TUNNELS/
